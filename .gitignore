@@ -17,5 +17,9 @@
 # Test binaries
 /tests/test_*
 
+
+# Project executables
+/main
+
 # Other
 *.log

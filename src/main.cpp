@@ -1,7 +1,5 @@
 #include <iostream>
-#include "DLL.h"
-#include "TRIE.h"
-#include "inMemoryDB.cpp"
+#include "InMemoryDB.h"
 
 int main() {
     std::cout << "InMemoryDB demo: basic insert and scanByPrefix" << std::endl;
