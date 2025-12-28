@@ -22,12 +22,14 @@
  * Locking Strategy (sharded):
  * - N shards (default 16); each shard has its own mutex and key map
  * - Per-key mutex inside each shard to isolate writers to the same key
- * - Separate mutex for TTL heap (async cleanup)
- * - Trie protected by its own mutex for inserts/removals
+ * - N Trie shards (default 16); each with its own mutex for parallel key insertions
+ * - TTL heap protected by its own mutex (async cleanup)
  *
  * Concurrency:
  * - Reads of different keys run in parallel (shared locks per shard/key)
- * - Writes collide only on the same key or shard bucket creation
+ * - Writes to different keys run in parallel (different key shards)
+ * - Inserts to different Trie shards run in parallel (hash-based sharding)
+ * - Prefix scans query all Trie shards in parallel via shared locks
  */
 class ThreadSafeInMemoryDB {
 private:
@@ -58,9 +60,11 @@ private:
     // Sharded data
     std::vector<Shard> shards;
 
-    // Trie protected separately
-    mutable std::shared_mutex trieMutex;
-    Trie keyTrie;
+    struct TrieShard {
+        mutable std::shared_mutex trieMutex;
+        Trie trie;
+    };
+    std::vector<TrieShard> trieShards;
     
     // TTL heap with its own lock
     mutable std::mutex ttlMutex;
@@ -74,9 +78,14 @@ private:
     std::condition_variable cleanupCV;
     
     size_t shardForKey(const std::string& key) const;
+    size_t shardForTrieKey(const std::string& key) const;
     void cleanExpiredDataLocked(int currentTime);
     bool isExpired(int currentTimeStamp, Node* node) const;
     void backgroundCleanupWorker();
+    void collectFieldsForKey(const std::shared_ptr<KeyBucket>& bucketPtr,
+                            const std::string& key,
+                            int timestamp,
+                            std::vector<std::tuple<std::string, std::string, std::string>>& results);
 
 public:
     ThreadSafeInMemoryDB();

@@ -12,7 +12,7 @@ ThreadSafeInMemoryDB::ThreadSafeInMemoryDB()
     : ThreadSafeInMemoryDB(true) {}
 
 ThreadSafeInMemoryDB::ThreadSafeInMemoryDB(bool enableBackground)
-    : shards(SHARD_COUNT), backgroundEnabled(enableBackground) {
+    : shards(SHARD_COUNT), trieShards(SHARD_COUNT), backgroundEnabled(enableBackground) {
     if (backgroundEnabled) {
         cleanupRunning = true;
         cleanupThread = std::thread(&ThreadSafeInMemoryDB::backgroundCleanupWorker, this);
@@ -68,6 +68,10 @@ size_t ThreadSafeInMemoryDB::shardForKey(const std::string& key) const {
     return std::hash<std::string>{}(key) % SHARD_COUNT;
 }
 
+size_t ThreadSafeInMemoryDB::shardForTrieKey(const std::string& key) const {
+    return std::hash<std::string>{}(key) % SHARD_COUNT;
+}
+
 void ThreadSafeInMemoryDB::cleanExpiredDataLocked(int currentTime) {
     std::lock_guard<std::mutex> ttlLock(ttlMutex);
 
@@ -107,8 +111,9 @@ void ThreadSafeInMemoryDB::cleanExpiredDataLocked(int currentTime) {
                     keyLock.unlock();
                     shard.keys.erase(keyIt);
 
-                    std::unique_lock<std::shared_mutex> trieLock(trieMutex);
-                    keyTrie.remove(key);
+                    size_t trieShard = shardForTrieKey(key);
+                    std::unique_lock<std::shared_mutex> trieLock(trieShards[trieShard].trieMutex);
+                    trieShards[trieShard].trie.remove(key);
                 }
             }
         }
@@ -152,8 +157,9 @@ bool ThreadSafeInMemoryDB::newInsert(const std::string& key,
     fieldEntry.node_map[timestamp] = newNode;
 
     if (inserted) {
-        std::unique_lock<std::shared_mutex> trieLock(trieMutex);
-        keyTrie.insert(key);
+        size_t trieShard = shardForTrieKey(key);
+        std::unique_lock<std::shared_mutex> trieLock(trieShards[trieShard].trieMutex);
+        trieShards[trieShard].trie.insert(key);
     }
 
     keyLock.unlock();
@@ -168,6 +174,23 @@ bool ThreadSafeInMemoryDB::newInsert(const std::string& key,
     return true;
 }
 
+void ThreadSafeInMemoryDB::collectFieldsForKey(
+    const std::shared_ptr<KeyBucket>& bucketPtr,
+    const std::string& key,
+    int timestamp,
+    std::vector<std::tuple<std::string, std::string, std::string>>& results) {
+    
+    for (const auto& [fieldName, fieldEntry] : bucketPtr->fields) {
+        if (!fieldEntry.dll) continue;
+
+        Node* latestNode = fieldEntry.dll->getLatest();
+        if (!latestNode || fieldEntry.dll->isDummy(latestNode)) continue;
+        if (isExpired(timestamp, latestNode)) continue;
+
+        results.emplace_back(key, fieldName, latestNode->record);
+    }
+}
+
 std::vector<std::tuple<std::string, std::string, std::string>>
 ThreadSafeInMemoryDB::scanByPrefix(const std::string& prefix, int timestamp) {
     std::vector<std::tuple<std::string, std::string, std::string>> results;
@@ -175,9 +198,10 @@ ThreadSafeInMemoryDB::scanByPrefix(const std::string& prefix, int timestamp) {
     if (prefix.empty()) return results;
 
     std::list<std::string> candidateKeys;
-    {
-        std::shared_lock<std::shared_mutex> trieLock(trieMutex);
-        candidateKeys = keyTrie.getWordsWithPrefix(prefix);
+    for (size_t i = 0; i < SHARD_COUNT; ++i) {
+        std::shared_lock<std::shared_mutex> trieLock(trieShards[i].trieMutex);
+        auto shardResults = trieShards[i].trie.getWordsWithPrefix(prefix);
+        candidateKeys.insert(candidateKeys.end(), shardResults.begin(), shardResults.end());
     }
 
     for (const auto& key : candidateKeys) {
@@ -191,15 +215,7 @@ ThreadSafeInMemoryDB::scanByPrefix(const std::string& prefix, int timestamp) {
         std::shared_ptr<KeyBucket> bucketPtr = keyIt->second;
         std::shared_lock<std::shared_mutex> keyLock(bucketPtr->keyMutex);
 
-        for (const auto& [fieldName, fieldEntry] : bucketPtr->fields) {
-            if (!fieldEntry.dll) continue;
-
-            Node* latestNode = fieldEntry.dll->getLatest();
-            if (!latestNode || fieldEntry.dll->isDummy(latestNode)) continue;
-            if (isExpired(timestamp, latestNode)) continue;
-
-            results.emplace_back(key, fieldName, latestNode->record);
-        }
+        collectFieldsForKey(bucketPtr, key, timestamp, results);
     }
 
     std::sort(results.begin(), results.end());
