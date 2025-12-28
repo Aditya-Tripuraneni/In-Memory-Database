@@ -44,4 +44,8 @@ public:
 
     std::vector<std::tuple<std::string, std::string, std::string>>
     scanByPrefix(const std::string& prefix, int timestamp);
+
+    std::optional<std::string> getValue(const std::string& key,
+                                        const std::string& field,
+                                        int timestamp);
 };

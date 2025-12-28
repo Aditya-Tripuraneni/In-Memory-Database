@@ -151,3 +151,38 @@ InMemoryDB::scanByPrefix(const std::string& prefix, int timestamp) {
 
     return results;
 }
+
+std::optional<std::string> InMemoryDB::getValue(
+    const std::string& key,
+    const std::string& field,
+    int timestamp) {
+    
+    cleanExpiredData(timestamp);
+    
+    auto keyIt = db.find(key);
+    if (keyIt == db.end()) {
+        return std::nullopt;
+    }
+    
+    auto& fields = keyIt->second;
+    auto fieldIt = fields.find(field);
+    if (fieldIt == fields.end()) {
+        return std::nullopt;
+    }
+    
+    auto& fieldEntry = fieldIt->second;
+    if (!fieldEntry.dll) {
+        return std::nullopt;
+    }
+    
+    Node* latestNode = fieldEntry.dll->getLatest();
+    if (!latestNode || fieldEntry.dll->isDummy(latestNode)) {
+        return std::nullopt;
+    }
+    
+    if (isExpired(timestamp, latestNode)) {
+        return std::nullopt;
+    }
+    
+    return latestNode->record;
+}
