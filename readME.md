@@ -75,65 +75,67 @@ db: unordered_map<string, FieldMap>
 - **Hardware**: 16-core CPU
 - **Operations**: 100,000 ops per test
 - **Dataset**: 500 keys × 3 fields for prefix scans
-- **Timeout**: 60 seconds per test
+- **Clock**: `steady_clock` (monotonic, not affected by network time protocol drift)
+- **Methodology**:
+  - Pre-generated keys (no string formatting in hot loops)
+  - Start gates (all threads begin simultaneously)
+  - Strided loops (exact op distribution across threads)
+  - Checksums (prevent dead-code elimination, validate correctness)
 
 ### 1. Insert Performance
 ```
-Test                          Ops      Threads   Time(ms)   Ops/sec      Latency(µs)
-─────────────────────────────────────────────────────────────────────────────────────
-Sync Insert (baseline)        100000   1         31.57      3,167,163    0.316
-MT Insert (1 thread)          100000   1         34.97      2,859,676    0.350
-MT Insert (2 threads)         100000   2         32.65      3,062,600    0.327
-MT Insert (4 threads)         100000   4         28.36      3,526,466    0.284
-MT Insert (8 threads)         100000   8         28.01      3,570,026    0.280
-MT Insert (16 threads)        100000   16        32.51      3,075,787    0.325
+Test                          Ops      Threads   Time(ms)   Ops/sec      Latency(µs)  Checksum
+────────────────────────────────────────────────────────────────────────────────────────────────
+Sync Insert (baseline)        100000   1         30.12      3,319,833    0.301        100000
+MT Insert (1 thread)          100000   1         77.96      1,282,726    0.780        100000
+MT Insert (2 threads)         100000   2         77.14      1,296,260    0.771        100000
+MT Insert (4 threads)         100000   4         47.24      2,116,626    0.472        100000
+MT Insert (8 threads)         100000   8         45.45      2,200,123    0.455        100000
+MT Insert (16 threads)        100000   16        74.51      1,342,030    0.745        100000
 ```
 
-**Observation**: Single-threaded MT has ~10% overhead from locking. 8 threads achieve **1.13× speedup** over sync baseline. Trie sharding (16 independent Trie+mutex pairs) distributes key insertion load, improving write parallelism vs. earlier single-global-Trie design.
+**Observation**: Single-threaded MT shows significant overhead (~2.5×) from lock acquisition and thread management. Peak performance at 8 threads achieves **2.2M ops/sec**. Write-heavy workloads are limited by lock contention on shared data structures. The checksum (successful insert count) validates all 100k operations completed.
 
 ### 2. Prefix Scan Performance
 ```
-Test                          Ops      Threads   Time(ms)   Ops/sec      Latency(µs)
-─────────────────────────────────────────────────────────────────────────────────────
-Sync Prefix Scan (baseline)   100000   1         30560.72   3,272        305.607
-MT Prefix Scan (1 thread)     100000   1         36829.39   2,715        368.294
-MT Prefix Scan (2 threads)    100000   2         19324.51   5,175        193.245
-MT Prefix Scan (4 threads)    100000   4         11011.71   9,081        110.117
-MT Prefix Scan (8 threads)    100000   8         7554.27    13,238       75.543
-MT Prefix Scan (16 threads)   100000   16        5379.67    18,588       53.797
-
-Checksum: 150,000,000 results (500 keys × 3 fields × 100,000 scans)
+Test                          Ops      Threads   Time(ms)   Ops/sec      Latency(µs)  Checksum
+────────────────────────────────────────────────────────────────────────────────────────────────
+Sync Prefix Scan (baseline)   100000   1         29334.81   3,409        293.348      150000000
+MT Prefix Scan (1 thread)     100000   1         33084.67   3,023        330.847      150000000
+MT Prefix Scan (2 threads)    100000   2         20160.06   4,960        201.601      150000000
+MT Prefix Scan (4 threads)    100000   4         11333.93   8,823        113.339      150000000
+MT Prefix Scan (8 threads)    100000   8         7082.81    14,119       70.828       150000000
+MT Prefix Scan (16 threads)   100000   16        5283.84    18,926       52.838       150000000
 ```
 
-**Observation**: Solid scaling. 16 threads achieve **5.7× speedup** over sync baseline. Trie sharding allowed parallel queries across 16 independent Trie+mutex pairs with shared locks, improving read throughput. Minimal improvement from old design (6.2% at 16 threads) since reads were already parallelized; the sharding mainly benefits write-heavy mixed workloads.
+**Observation**: Excellent scaling. 16 threads achieve **5.6× speedup** over sync baseline (18,926 vs 3,409 ops/sec). Shared locks enable parallel reads across Trie shards with minimal contention. Checksum validates correctness: 150M = 500 keys × 3 fields × 100k scans.
 
 ### 3. Mixed Workload (80% Read, 20% Write)
 ```
-Test                          Ops      Threads   Time(ms)   Ops/sec      Latency(µs)
-─────────────────────────────────────────────────────────────────────────────────────
-Sync Mixed (baseline)         100000   1         1231.87    81,177       12.319
-MT Mixed (2 threads)          100000   2         1153.41    86,700       11.534
-MT Mixed (4 threads)          100000   4         672.74     148,647      6.727
-MT Mixed (8 threads)          100000   8         451.85     221,313      4.518
-MT Mixed (16 threads)         100000   16        486.10     205,719      4.861
+Test                          Ops      Threads   Time(ms)   Ops/sec      Latency(µs)  Checksum
+────────────────────────────────────────────────────────────────────────────────────────────────
+Sync Mixed (baseline)         100000   1         1302.79    76,758       13.028       8020000
+MT Mixed (2 threads)          100000   2         1079.88    92,603       10.799       8020000
+MT Mixed (4 threads)          100000   4         646.16     154,761      6.462        8020000
+MT Mixed (8 threads)          100000   8         484.31     206,481      4.843        8020000
+MT Mixed (16 threads)         100000   16        513.96     194,570      5.140        8020000
 ```
 
-**Observation**: 8 threads achieve **2.7× speedup** over sync baseline. Trie sharding significantly improved write scaling: 8 threads now reach 221k ops/sec (was 182k) and 16 threads jump from 147k to 206k ops/sec (+40% improvement). Write parallelism was clearly improved to increase throughput.
+**Observation**: 8 threads achieve **2.7× speedup** over sync baseline (206k vs 77k ops/sec). Performance peaks at 8 threads; 16 threads show slight regression due to write contention. Checksum validates mixed operation correctness across all thread configurations.
 
 ### 4. Point Lookups (getValue)
 ```
-Test                          Ops      Threads   Time(ms)   Ops/sec      Latency(µs)
-─────────────────────────────────────────────────────────────────────────────────────
-Sync getValue (baseline)      100000   1         7.73       12,934,937   0.077
-MT getValue (1 thread)        100000   1         10.55      9,477,775    0.106
-MT getValue (2 threads)       100000   2         8.23       12,144,766   0.082
-MT getValue (4 threads)       100000   4         4.85       20,627,063   0.048
-MT getValue (8 threads)       100000   8         3.27       30,599,755   0.033
-MT getValue (16 threads)      100000   16        3.31       30,202,356   0.033
-
+Test                          Ops      Threads   Time(ms)   Ops/sec      Latency(µs)  Checksum
+────────────────────────────────────────────────────────────────────────────────────────────────
+Sync getValue (baseline)      100000   1         4.09       24,437,928   0.041        300000
+MT getValue (1 thread)        100000   1         6.94       14,407,146   0.069        300000
+MT getValue (2 threads)       100000   2         4.69       21,303,792   0.047        300000
+MT getValue (4 threads)       100000   4         2.99       33,444,816   0.030        300000
+MT getValue (8 threads)       100000   8         2.61       38,358,266   0.026        300000
+MT getValue (16 threads)      100000   16        3.01       33,255,737   0.030        300000
 ```
 
-**Observation**: Near linear scaling. 16 threads achieve **2.4× speedup** over sync baseline with minimal lock overhead for read-only operations.
+**Observation**: Excellent scaling for pure reads. 8 threads achieve **1.6× speedup** over sync baseline (38M vs 24M ops/sec). Sync baseline is already fast (~24M ops/sec) due to O(1) hash lookups. Checksum = 300k validates all lookups returned 3-char "val" strings.
 
 ---
 
@@ -141,26 +143,26 @@ MT getValue (16 threads)      100000   16        3.31       30,202,356   0.033
 
 | Metric | Synchronous | Multi-Threaded (8 threads) | Speedup |
 |--------|-------------|---------------------------|---------|
-| Insert Latency | 0.316 µs | 0.280 µs | 1.13× |
-| Prefix Scan Latency | 305.607 µs | 75.543 µs | **4.0×** |
-| Mixed Workload Latency | 12.319 µs | 4.518 µs | **2.7×** |
-| Point Lookup Latency | 0.077 µs | 0.033 µs | **2.3×** |
+| Insert Throughput | 3.3M ops/sec | 2.2M ops/sec | 0.67× |
+| Prefix Scan Latency | 293.3 µs | 70.8 µs | **4.1×** |
+| Mixed Workload Latency | 13.0 µs | 4.8 µs | **2.7×** |
+| Point Lookup Throughput | 24.4M ops/sec | 38.4M ops/sec | **1.6×** |
 | Memory Overhead | Baseline | +48 bytes/key (mutexes) | - |
 | TTL Cleanup | Synchronous (blocking) | Async (background thread) | Non-blocking |
 
 ### Key Observations
 
-1. **Read-Heavy Workloads Excel**: Prefix scans and point lookups show 4-5× improvement with 8-16 threads due to shared locks allowing parallel reads.
+1. **Read-Heavy Workloads Excel**: Prefix scans show **5.6× speedup** at 16 threads due to shared locks allowing parallel Trie traversals. Point lookups achieve **38M ops/sec** at 8 threads.
 
-2. **Write Scalability Improved**: Trie sharding (16 independent Trie+mutex pairs) enables parallel inserts to different key shards. Mixed workload speedup at 16 threads improved from 2.1× to 2.7×, with insert throughput gaining +40% at 16 threads.
+2. **Write Contention Limits Scaling**: Pure insert workloads are slower with threading due to lock contention. The sync baseline (3.3M ops/sec) outperforms MT versions because hash-map inserts are already fast and locking adds overhead.
 
-3. **Locking Overhead**: Single-threaded MT version is ~10% slower than sync due to mutex acquisition/release costs, even without contention.
+3. **Locking Overhead is Significant**: Single-threaded MT is ~2.5× slower than sync for inserts, ~1.7× slower for point lookups. This overhead is the cost of thread-safety even without contention.
 
-4. **Optimal Thread Count**: Performance peaks around 8 threads for most workloads; 16 threads show diminishing returns due to increased context switching and cache coherency overhead.
+4. **Optimal Thread Count is 8**: Performance peaks at 8 threads across all workloads. 16 threads show diminishing returns due to lock contention and cache coherency overhead.
 
-5. **Async TTL Cleanup Works**: Background worker with adaptive wake-up (peeking heap for next expiry) prevents blocking main operations while keeping memory usage bounded.
+5. **Mixed Workloads Benefit Most**: 80/20 read-write ratio achieves **2.7× speedup** because reads (majority) parallelize well while writes remain serialized.
 
-6. **Trie Memory Trade-off**: Current design stores complete key strings in `unordered_set` at each node. With 500 keys this is fast, but memory scales as O(keys × depth). Acceptable at current scale; would need optimization beyond 10k keys.
+6. **LRU Eviction Bounds Memory**: Each (key, field) pair maintains at most 100 versions via DLL eviction, preventing unbounded growth under high write loads.
 
 ---
 
@@ -235,22 +237,27 @@ int main() {
 
 ## Conclusion
 
-This experiment demonstrates that **reader-writer locks with sharding provide substantial performance gains for read-heavy workloads** (4-5× speedup), while write-heavy patterns see modest improvements (~1.1×) limited by global Trie contention. The sharded architecture with per-key locks strikes a balance between concurrency and complexity, making it suitable for multi-threaded applications without major code restructuring.
+This experiment demonstrates that **reader-writer locks with sharding provide substantial performance gains for read-heavy workloads** (4-6× speedup for prefix scans), while **write-heavy patterns actually weakens** due to lock contention overhead. The sync baseline remains faster for pure inserts (~3.3M vs ~2.2M ops/sec at 8 threads).
 
-Key takeaway: **Fine-grained locking pays off when reads dominate**, but write scalability requires more sophisticated techniques like lock-free data structures or MVCC.
+Key takeaway: **Multi-threading is worthwhile when reads dominate** (prefix scans, point lookups). For write-heavy workloads, consider lock-free data structures, batched writes, or accepting single-threaded performance. The sharded architecture with per-key locks provides correctness and reasonable read scaling without major complexity.
 
 ---
 
 ## Acknowledgments
 
-**Experimental Context**: This benchmark is a **hot-cache experiment**. All data remains in memory throughout execution, with threads repeatedly accessing the same 500-key dataset (500 keys × 3 fields). Results reflect performance under ideal cache conditions with no page faults, I/O, or memory pressure. Real-world performance may vary significantly with:
+**Experimental Context**: This benchmark is a **hot-cache microbenchmark**. All data remains in memory throughout execution, with threads repeatedly accessing the same 500-key dataset (500 keys × 3 fields). Results reflect peak throughput under ideal conditions with no page faults, I/O, or memory pressure. Real-world performance may vary significantly with:
 
 - **Large datasets** causing cache misses
 - **Non-uniform access patterns** with temporal/spatial locality variations
 - **Competing processes** sharing CPU and L3 cache
 - **Real workloads** with unpredictable key distributions and field cardinality
 
-**Benchmarking methodology**: Operations are CPU bound within a loop (100k iterations per test). No realistic delays, network latency, or I/O operations are simulated. Insert operations do not trigger evictions or rehashing (capacity pre-allocated). Prefix scans query the same prefix repeatedly (stable working set).
-
+**Benchmarking Methodology**:
+- **Timing**: `steady_clock` 
+- **Pre-generated keys**: All key strings allocated before timing begins
+- **Start gates**: Threads synchronize via atomic flag before measurement starts
+- **Strided loops**: Exact operation count distributed evenly across threads
+- **Checksums**: Consumed results prevent compiler dead-code elimination and validate correctness
+- **No warmup contamination**: Fresh DB instance per test configuration
 
 Benchmark suite designed to evaluate multi-threading strategies across 4 workload patterns. Trie-based prefix search adapted from standard implementations; 16-shard architecture with per-key locks and Trie sharding are custom optimizations.

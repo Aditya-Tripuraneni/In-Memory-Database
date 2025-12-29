@@ -83,33 +83,33 @@ void ThreadSafeInMemoryDB::cleanExpiredDataLocked(int currentTime) {
         const std::string& field = std::get<2>(entry);
         int timestamp = std::get<3>(entry);
 
-        size_t shardIdx = shardForKey(key);
-        Shard& shard = shards[shardIdx];
+        size_t shardIndex = shardForKey(key);
+        Shard& shard = shards[shardIndex];
         std::unique_lock<std::shared_mutex> shardLock(shard.shardMutex);
 
-        auto keyIt = shard.keys.find(key);
-        if (keyIt == shard.keys.end()) continue;
+        auto keyEntry = shard.keys.find(key);
+        if (keyEntry == shard.keys.end()) continue;
 
-        std::shared_ptr<KeyBucket> bucketPtr = keyIt->second;
-        std::unique_lock<std::shared_mutex> keyLock(bucketPtr->keyMutex);
+        std::shared_ptr<KeyBucket> keyBucket = keyEntry->second;
+        std::unique_lock<std::shared_mutex> keyLock(keyBucket->keyMutex);
 
-        auto fieldIt = bucketPtr->fields.find(field);
-        if (fieldIt == bucketPtr->fields.end()) continue;
+        auto fieldMapEntry = keyBucket->fields.find(field);
+        if (fieldMapEntry == keyBucket->fields.end()) continue;
 
-        auto& fieldEntry = fieldIt->second;
-        auto nodeIt = fieldEntry.node_map.find(timestamp);
-        if (nodeIt == fieldEntry.node_map.end()) continue;
+        auto& fieldEntry = fieldMapEntry->second;
+        auto nodeMapEntry = fieldEntry.node_map.find(timestamp);
+        if (nodeMapEntry == fieldEntry.node_map.end()) continue;
 
-        Node* nodeToDelete = nodeIt->second;
+        Node* nodeToDelete = nodeMapEntry->second;
         if (nodeToDelete && fieldEntry.dll) {
             fieldEntry.dll->deleteNode(nodeToDelete);
-            fieldEntry.node_map.erase(nodeIt);
+            fieldEntry.node_map.erase(nodeMapEntry);
 
             if (fieldEntry.dll->getLength() == 0) {
-                bucketPtr->fields.erase(fieldIt);
-                if (bucketPtr->fields.empty()) {
+                keyBucket->fields.erase(fieldMapEntry);
+                if (keyBucket->fields.empty()) {
                     keyLock.unlock();
-                    shard.keys.erase(keyIt);
+                    shard.keys.erase(keyEntry);
 
                     size_t trieShard = shardForTrieKey(key);
                     std::unique_lock<std::shared_mutex> trieLock(trieShards[trieShard].trieMutex);
@@ -134,16 +134,16 @@ bool ThreadSafeInMemoryDB::newInsert(const std::string& key,
         return false;
     }
 
-    size_t shardIdx = shardForKey(key);
-    Shard& shard = shards[shardIdx];
+    size_t shardIndex = shardForKey(key);
+    Shard& shard = shards[shardIndex];
     std::unique_lock<std::shared_mutex> shardLock(shard.shardMutex);
 
-    auto [keyIt, inserted] = shard.keys.emplace(key, std::make_shared<KeyBucket>());
-    std::shared_ptr<KeyBucket> bucketPtr = keyIt->second;
+    auto [keyEntry, inserted] = shard.keys.emplace(key, std::make_shared<KeyBucket>());
+    std::shared_ptr<KeyBucket> keyBucket = keyEntry->second;
 
-    std::unique_lock<std::shared_mutex> keyLock(bucketPtr->keyMutex);
+    std::unique_lock<std::shared_mutex> keyLock(keyBucket->keyMutex);
 
-    FieldEntry& fieldEntry = bucketPtr->fields[field];
+    FieldEntry& fieldEntry = keyBucket->fields[field];
     if (!fieldEntry.dll) {
         fieldEntry.dll = std::make_unique<DLL>();
     }
@@ -155,6 +155,21 @@ bool ThreadSafeInMemoryDB::newInsert(const std::string& key,
     Node* newNode = new Node(record, timestamp, ttl);
     fieldEntry.dll->insertAtEnd(newNode);
     fieldEntry.node_map[timestamp] = newNode;
+
+    // LRU eviction: if DLL exceeds max versions, remove oldest node
+    if (static_cast<size_t>(fieldEntry.dll->getLength()) > MAX_VERSIONS_PER_FIELD) {
+        Node* oldestNode = fieldEntry.dll->getOldest();
+        if (oldestNode && !fieldEntry.dll->isDummy(oldestNode)) {
+            // Find the timestamp of the oldest node to remove it from node_map
+            for (auto it = fieldEntry.node_map.begin(); it != fieldEntry.node_map.end(); ++it) {
+                if (it->second == oldestNode) {
+                    fieldEntry.node_map.erase(it);
+                    break;
+                }
+            }
+            fieldEntry.dll->deleteNode(oldestNode);
+        }
+    }
 
     if (inserted) {
         size_t trieShard = shardForTrieKey(key);
@@ -175,12 +190,12 @@ bool ThreadSafeInMemoryDB::newInsert(const std::string& key,
 }
 
 void ThreadSafeInMemoryDB::collectFieldsForKey(
-    const std::shared_ptr<KeyBucket>& bucketPtr,
+    const std::shared_ptr<KeyBucket>& keyBucket,
     const std::string& key,
     int timestamp,
     std::vector<std::tuple<std::string, std::string, std::string>>& results) {
     
-    for (const auto& [fieldName, fieldEntry] : bucketPtr->fields) {
+    for (const auto& [fieldName, fieldEntry] : keyBucket->fields) {
         if (!fieldEntry.dll) continue;
 
         Node* latestNode = fieldEntry.dll->getLatest();
@@ -205,17 +220,17 @@ ThreadSafeInMemoryDB::scanByPrefix(const std::string& prefix, int timestamp) {
     }
 
     for (const auto& key : candidateKeys) {
-        size_t shardIdx = shardForKey(key);
-        Shard& shard = shards[shardIdx];
+        size_t shardIndex = shardForKey(key);
+        Shard& shard = shards[shardIndex];
         std::shared_lock<std::shared_mutex> shardLock(shard.shardMutex);
 
-        auto keyIt = shard.keys.find(key);
-        if (keyIt == shard.keys.end()) continue;
+        auto keyEntry = shard.keys.find(key);
+        if (keyEntry == shard.keys.end()) continue;
 
-        std::shared_ptr<KeyBucket> bucketPtr = keyIt->second;
-        std::shared_lock<std::shared_mutex> keyLock(bucketPtr->keyMutex);
+        std::shared_ptr<KeyBucket> keyBucket = keyEntry->second;
+        std::shared_lock<std::shared_mutex> keyLock(keyBucket->keyMutex);
 
-        collectFieldsForKey(bucketPtr, key, timestamp, results);
+        collectFieldsForKey(keyBucket, key, timestamp, results);
     }
 
     std::sort(results.begin(), results.end());
@@ -227,20 +242,20 @@ std::optional<std::string> ThreadSafeInMemoryDB::getValue(
     const std::string& field,
     int timestamp) {
 
-    size_t shardIdx = shardForKey(key);
-    Shard& shard = shards[shardIdx];
+    size_t shardIndex = shardForKey(key);
+    Shard& shard = shards[shardIndex];
     std::shared_lock<std::shared_mutex> shardLock(shard.shardMutex);
 
-    auto keyIt = shard.keys.find(key);
-    if (keyIt == shard.keys.end()) return std::nullopt;
+    auto keyEntry = shard.keys.find(key);
+    if (keyEntry == shard.keys.end()) return std::nullopt;
 
-    std::shared_ptr<KeyBucket> bucketPtr = keyIt->second;
-    std::shared_lock<std::shared_mutex> keyLock(bucketPtr->keyMutex);
+    std::shared_ptr<KeyBucket> keyBucket = keyEntry->second;
+    std::shared_lock<std::shared_mutex> keyLock(keyBucket->keyMutex);
 
-    auto fieldIt = bucketPtr->fields.find(field);
-    if (fieldIt == bucketPtr->fields.end()) return std::nullopt;
+    auto fieldMapEntry = keyBucket->fields.find(field);
+    if (fieldMapEntry == keyBucket->fields.end()) return std::nullopt;
 
-    const auto& fieldEntry = fieldIt->second;
+    const auto& fieldEntry = fieldMapEntry->second;
     if (!fieldEntry.dll) return std::nullopt;
 
     Node* latestNode = fieldEntry.dll->getLatest();
@@ -262,4 +277,24 @@ size_t ThreadSafeInMemoryDB::getKeyCount() const {
 size_t ThreadSafeInMemoryDB::getTTLQueueSize() const {
     std::lock_guard<std::mutex> lock(ttlMutex);
     return minHeapTTLData.size();
+}
+
+size_t ThreadSafeInMemoryDB::getVersionCount(const std::string& key, const std::string& field) const {
+    size_t shardIndex = shardForKey(key);
+    const Shard& shard = shards[shardIndex];
+    std::shared_lock<std::shared_mutex> shardLock(shard.shardMutex);
+
+    auto keyEntry = shard.keys.find(key);
+    if (keyEntry == shard.keys.end()) return 0;
+
+    std::shared_ptr<KeyBucket> keyBucket = keyEntry->second;
+    std::shared_lock<std::shared_mutex> keyLock(keyBucket->keyMutex);
+
+    auto fieldMapEntry = keyBucket->fields.find(field);
+    if (fieldMapEntry == keyBucket->fields.end()) return 0;
+
+    const auto& fieldEntry = fieldMapEntry->second;
+    if (!fieldEntry.dll) return 0;
+
+    return static_cast<size_t>(fieldEntry.dll->getLength());
 }

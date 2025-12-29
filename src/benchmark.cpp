@@ -6,6 +6,9 @@
  * Evaluates multi-threaded performance compared to synchronous implementations
  * across various workload patterns including inserts, prefix scans, mixed
  * read-write operations, and point lookups.
+ * 
+ * NOTE: This is a hot-cache microbenchmark with a small working set and no I/O.
+ * Results reflect peak throughput under ideal conditions, not production workloads.
  */
 
 #include <iostream>
@@ -14,18 +17,83 @@
 #include <vector>
 #include <atomic>
 #include <iomanip>
-#include <future>
 #include <functional>
 
 #include "InMemoryDB.h"
 #include "ThreadSafeInMemoryDB.h"
 
-// Configurations
-constexpr int BENCHMARK_TIMEOUT_MS = 60000;  
-constexpr int WARMUP_OPS = 100;
+using Clock = std::chrono::steady_clock;
+using Micros = std::chrono::microseconds;
 
 // Hardware info
 const unsigned int NUM_CORES = std::thread::hardware_concurrency();
+
+//------------------------------------------------------------------------------
+// Pre-generated keys to avoid string formatting in hot loops
+//------------------------------------------------------------------------------
+
+std::vector<std::string> pregenKeys;
+std::vector<std::string> pregenUserKeys;
+std::vector<std::string> pregenFields;
+
+void initPregenKeys(int maxKeys) {
+    pregenKeys.resize(maxKeys);
+    pregenUserKeys.resize(maxKeys);
+    pregenFields.resize(10);
+    
+    for (int i = 0; i < maxKeys; ++i) {
+        pregenKeys[i] = "k" + std::to_string(i);
+        pregenUserKeys[i] = "user" + std::to_string(i);
+    }
+    for (int i = 0; i < 10; ++i) {
+        pregenFields[i] = "f" + std::to_string(i);
+    }
+}
+
+//------------------------------------------------------------------------------
+// Time Helpers
+//------------------------------------------------------------------------------
+
+inline long long elapsedMicros(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration_cast<Micros>(end - start).count();
+}
+
+inline double microsToMs(long long micros) {
+    return micros / 1000.0;
+}
+
+inline double opsPerSecond(int ops, long long micros) {
+    return (ops * 1e6) / micros;
+}
+
+inline double avgLatencyUs(int ops, long long micros) {
+    return static_cast<double>(micros) / ops;
+}
+
+
+template<typename WorkerFn>
+long long runThreaded(int numThreads, WorkerFn workerFn) {
+    std::atomic<bool> startFlag{false};
+    std::atomic<int> readyCount{0};
+    
+    std::vector<std::thread> threads;
+    for (int t = 0; t < numThreads; ++t) {
+        threads.emplace_back([&, t]() {
+            readyCount.fetch_add(1);
+            while (!startFlag.load(std::memory_order_acquire)) {}
+            workerFn(t);
+        });
+    }
+    
+    while (readyCount.load() < numThreads) {}
+    
+    auto start = Clock::now();
+    startFlag.store(true, std::memory_order_release);
+    for (auto& th : threads) th.join();
+    auto end = Clock::now();
+    
+    return elapsedMicros(start, end);
+}
 
 //------------------------------------------------------------------------------
 // Utilities
@@ -38,7 +106,13 @@ struct BenchResult {
     double timeMs;
     double opsPerSec;
     double avgLatencyUs;
-    bool timedOut;
+    long long checksum;
+    
+    static BenchResult create(const std::string& name, int ops, int threads, 
+                              long long micros, long long checksum = 0) {
+        return {name, ops, threads, microsToMs(micros), 
+                opsPerSecond(ops, micros), ::avgLatencyUs(ops, micros), checksum};
+    }
 };
 
 void printHeader() {
@@ -48,10 +122,9 @@ void printHeader() {
               << std::setw(8)  << "Threads"
               << std::setw(12) << "Time(ms)"
               << std::setw(15) << "Ops/sec"
-              << std::setw(12) << "Latency(µs)"
-              << std::setw(10) << "Status"
+              << std::setw(12) << "Latency(us)"
               << "\n";
-    std::cout << std::string(112, '-') << "\n";
+    std::cout << std::string(102, '-') << "\n";
 }
 
 void printResult(const BenchResult& r) {
@@ -62,37 +135,10 @@ void printResult(const BenchResult& r) {
               << std::setw(12) << std::fixed << std::setprecision(2) << r.timeMs
               << std::setw(15) << std::fixed << std::setprecision(0) << r.opsPerSec
               << std::setw(12) << std::fixed << std::setprecision(3) << r.avgLatencyUs
-              << std::setw(10) << (r.timedOut ? "TIMEOUT" : "OK")
               << "\n";
-}
-
-// Run a benchmark with timeout protection
-template<typename Func>
-BenchResult runWithTimeout(const std::string& name, int ops, int threads, Func&& fn) {
-    BenchResult result{name, ops, threads, 0, 0, 0, false};
-    
-    auto task = std::async(std::launch::async, [&]() {
-        auto start = std::chrono::high_resolution_clock::now();
-        fn();
-        auto end = std::chrono::high_resolution_clock::now();
-        return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-    });
-    
-    auto status = task.wait_for(std::chrono::milliseconds(BENCHMARK_TIMEOUT_MS));
-    
-    if (status == std::future_status::timeout) {
-        result.timedOut = true;
-        result.timeMs = BENCHMARK_TIMEOUT_MS;
-        result.opsPerSec = 0;
-        result.avgLatencyUs = 0;
-    } else {
-        long long micros = task.get();
-        result.timeMs = micros / 1000.0;
-        result.opsPerSec = (ops * 1e6) / micros;
-        result.avgLatencyUs = static_cast<double>(micros) / ops;
+    if (r.checksum != 0) {
+        std::cout << "   Checksum: " << r.checksum << "\n";
     }
-    
-    return result;
 }
 
 //------------------------------------------------------------------------------
@@ -107,16 +153,22 @@ void benchmarkInserts() {
     printHeader();
     
     const int OPS = 100000;
+    const int KEY_MOD = 100;
     
     // Synchronous baseline
     {
         InMemoryDB db;
-        auto result = runWithTimeout("Sync Insert (baseline)", OPS, 1, [&]() {
-            for (int i = 0; i < OPS; ++i) {
-                db.newInsert("k" + std::to_string(i % 100), "f", "v", i);
+        long long successCount = 0;
+        
+        auto start = Clock::now();
+        for (int i = 0; i < OPS; ++i) {
+            if (db.newInsert(pregenKeys[i % KEY_MOD], pregenFields[0], "v", i)) {
+                successCount++;
             }
-        });
-        printResult(result);
+        }
+        auto end = Clock::now();
+        long long micros = elapsedMicros(start, end);
+        printResult(BenchResult::create("Sync Insert (baseline)", OPS, 1, micros, successCount));
     }
     
     // Multi-threaded with varying thread counts
@@ -124,26 +176,21 @@ void benchmarkInserts() {
     if (NUM_CORES >= 16) threadCounts.push_back(16);
     
     for (int numThreads : threadCounts) {
-        ThreadSafeInMemoryDB db(false);  // Disable background cleanup
+        ThreadSafeInMemoryDB db(false);
+        std::atomic<long long> successCount{0};
         
-        auto result = runWithTimeout(
-            "MT Insert (" + std::to_string(numThreads) + " threads)",
-            OPS, numThreads, [&]() {
-                std::vector<std::thread> threads;
-                std::atomic<int> counter{0};
-                
-                for (int t = 0; t < numThreads; ++t) {
-                    threads.emplace_back([&, t]() {
-                        int opsPerThread = OPS / numThreads;
-                        for (int i = 0; i < opsPerThread; ++i) {
-                            int idx = counter.fetch_add(1);
-                            db.newInsert("k" + std::to_string(idx % 100), "f", "v", idx);
-                        }
-                    });
+        long long micros = runThreaded(numThreads, [&](int t) {
+            long long localSuccess = 0;
+            for (int i = t; i < OPS; i += numThreads) {
+                if (db.newInsert(pregenKeys[i % KEY_MOD], pregenFields[0], "v", i)) {
+                    localSuccess++;
                 }
-                for (auto& th : threads) th.join();
-            });
-        printResult(result);
+            }
+            successCount.fetch_add(localSuccess, std::memory_order_relaxed);
+        });
+        
+        printResult(BenchResult::create("MT Insert (" + std::to_string(numThreads) + " threads)", 
+                                        OPS, numThreads, micros, successCount.load()));
     }
 }
 
@@ -158,28 +205,34 @@ void benchmarkReads() {
     
     printHeader();
     
-    const int SETUP_KEYS = 500; //! to be tweaked later to bench mark on larger keyspace
+    const int SETUP_KEYS = 500;
     const int FIELDS_PER_KEY = 3;
-    const int READ_OPS = 100000;  // Reduced from 100k for reasonable runtime
+    const int READ_OPS = 100000;
+    
+    // Pre-generate key names for setup
+    std::vector<std::string> keyNames(SETUP_KEYS);
+    for (int i = 0; i < SETUP_KEYS; ++i) {
+        keyNames[i] = "key" + std::to_string(i);
+    }
     
     // Synchronous baseline
     {
         InMemoryDB db;
         for (int i = 0; i < SETUP_KEYS; ++i) {
             for (int f = 0; f < FIELDS_PER_KEY; ++f) {
-                db.newInsert("key" + std::to_string(i), "f" + std::to_string(f), "v" + std::to_string(f), i);
+                db.newInsert(keyNames[i], pregenFields[f], "v", i);
             }
         }
 
         long long totalResults = 0;
-        auto result = runWithTimeout("Sync Prefix Scan (baseline)", READ_OPS, 1, [&]() {
-            for (int i = 0; i < READ_OPS; ++i) {
-                auto results = db.scanByPrefix("key", SETUP_KEYS + i);
-                totalResults += static_cast<long long>(results.size());
-            }
-        });
-        printResult(result);
-        std::cout << "   Checksum (results counted): " << totalResults << "\n";
+        auto start = Clock::now();
+        for (int i = 0; i < READ_OPS; ++i) {
+            auto results = db.scanByPrefix("key", SETUP_KEYS + i);
+            totalResults += static_cast<long long>(results.size());
+        }
+        auto end = Clock::now();
+        long long micros = elapsedMicros(start, end);
+        printResult(BenchResult::create("Sync Prefix Scan (baseline)", READ_OPS, 1, micros, totalResults));
     }
     
     // Multi-threaded reads
@@ -190,29 +243,23 @@ void benchmarkReads() {
         ThreadSafeInMemoryDB db(false);
         for (int i = 0; i < SETUP_KEYS; ++i) {
             for (int f = 0; f < FIELDS_PER_KEY; ++f) {
-                db.newInsert("key" + std::to_string(i), "f" + std::to_string(f), "v" + std::to_string(f), i);
+                db.newInsert(keyNames[i], pregenFields[f], "v", i);
             }
         }
 
         std::atomic<long long> totalResults{0};
-        auto result = runWithTimeout(
-            "MT Prefix Scan (" + std::to_string(numThreads) + " threads)",
-            READ_OPS, numThreads, [&]() {
-                std::vector<std::thread> threads;
-                
-                for (int t = 0; t < numThreads; ++t) {
-                    threads.emplace_back([&, t]() {
-                        int opsPerThread = READ_OPS / numThreads;
-                        for (int i = 0; i < opsPerThread; ++i) {
-                            auto results = db.scanByPrefix("key", SETUP_KEYS + t * opsPerThread + i);
-                            totalResults.fetch_add(static_cast<long long>(results.size()), std::memory_order_relaxed);
-                        }
-                    });
-                }
-                for (auto& th : threads) th.join();
-            });
-        printResult(result);
-        std::cout << "   Checksum (results counted): " << totalResults.load() << "\n";
+        
+        long long micros = runThreaded(numThreads, [&](int t) {
+            long long localResults = 0;
+            for (int i = t; i < READ_OPS; i += numThreads) {
+                auto results = db.scanByPrefix("key", SETUP_KEYS + i);
+                localResults += static_cast<long long>(results.size());
+            }
+            totalResults.fetch_add(localResults, std::memory_order_relaxed);
+        });
+        
+        printResult(BenchResult::create("MT Prefix Scan (" + std::to_string(numThreads) + " threads)", 
+                                        READ_OPS, numThreads, micros, totalResults.load()));
     }
 }
 
@@ -234,19 +281,24 @@ void benchmarkMixed() {
     {
         InMemoryDB db;
         for (int i = 0; i < SETUP_OPS; ++i) {
-            db.newInsert("user" + std::to_string(i), "f", "v", i);
+            db.newInsert(pregenUserKeys[i], pregenFields[0], "v", i);
         }
         
-        auto result = runWithTimeout("Sync Mixed (baseline)", MIXED_OPS, 1, [&]() {
-            for (int i = 0; i < MIXED_OPS; ++i) {
-                if (i % 5 == 0) {
-                    db.newInsert("user" + std::to_string(i % 100), "f", "v", SETUP_OPS + i);
-                } else {
-                    db.scanByPrefix("user", SETUP_OPS + i);
+        long long checksum = 0;
+        auto start = Clock::now();
+        for (int i = 0; i < MIXED_OPS; ++i) {
+            if (i % 5 == 0) {
+                if (db.newInsert(pregenUserKeys[i % 100], pregenFields[0], "v", SETUP_OPS + i)) {
+                    checksum++;
                 }
+            } else {
+                auto results = db.scanByPrefix("user", SETUP_OPS + i);
+                checksum += static_cast<long long>(results.size());
             }
-        });
-        printResult(result);
+        }
+        auto end = Clock::now();
+        long long micros = elapsedMicros(start, end);
+        printResult(BenchResult::create("Sync Mixed (baseline)", MIXED_OPS, 1, micros, checksum));
     }
     
     // Multi-threaded mixed
@@ -256,33 +308,30 @@ void benchmarkMixed() {
     for (int numThreads : threadCounts) {
         ThreadSafeInMemoryDB db(false);
         for (int i = 0; i < SETUP_OPS; ++i) {
-            db.newInsert("user" + std::to_string(i), "f", "v", i);
+            db.newInsert(pregenUserKeys[i], pregenFields[0], "v", i);
         }
         
-        std::atomic<int> writeCounter{SETUP_OPS};
+        std::atomic<int> writeTimestamp{SETUP_OPS};
+        std::atomic<long long> checksum{0};
         
-        auto result = runWithTimeout(
-            "MT Mixed (" + std::to_string(numThreads) + " threads)",
-            MIXED_OPS, numThreads, [&]() {
-                std::vector<std::thread> threads;
-                
-                for (int t = 0; t < numThreads; ++t) {
-                    threads.emplace_back([&, t]() {
-                        int opsPerThread = MIXED_OPS / numThreads;
-                        for (int i = 0; i < opsPerThread; ++i) {
-                            int globalIdx = t * opsPerThread + i;
-                            if (globalIdx % 5 == 0) {
-                                int ts = writeCounter.fetch_add(1);
-                                db.newInsert("user" + std::to_string(globalIdx % 100), "f", "v", ts);
-                            } else {
-                                db.scanByPrefix("user", SETUP_OPS + globalIdx);
-                            }
-                        }
-                    });
+        long long micros = runThreaded(numThreads, [&](int t) {
+            long long localChecksum = 0;
+            for (int i = t; i < MIXED_OPS; i += numThreads) {
+                if (i % 5 == 0) {
+                    int ts = writeTimestamp.fetch_add(1);
+                    if (db.newInsert(pregenUserKeys[i % 100], pregenFields[0], "v", ts)) {
+                        localChecksum++;
+                    }
+                } else {
+                    auto results = db.scanByPrefix("user", SETUP_OPS + i);
+                    localChecksum += static_cast<long long>(results.size());
                 }
-                for (auto& th : threads) th.join();
-            });
-        printResult(result);
+            }
+            checksum.fetch_add(localChecksum, std::memory_order_relaxed);
+        });
+        
+        printResult(BenchResult::create("MT Mixed (" + std::to_string(numThreads) + " threads)", 
+                                        MIXED_OPS, numThreads, micros, checksum.load()));
     }
 }
 
@@ -304,15 +353,20 @@ void benchmarkPointLookups() {
     {
         InMemoryDB db;
         for (int i = 0; i < SETUP_OPS; ++i) {
-            db.newInsert("k" + std::to_string(i), "f", "val" + std::to_string(i), i);
+            db.newInsert(pregenKeys[i], pregenFields[0], "val", i);
         }
         
-        auto result = runWithTimeout("Sync getValue (baseline)", LOOKUP_OPS, 1, [&]() {
-            for (int i = 0; i < LOOKUP_OPS; ++i) {
-                db.getValue("k" + std::to_string(i % SETUP_OPS), "f", SETUP_OPS);
+        long long checksum = 0;
+        auto start = Clock::now();
+        for (int i = 0; i < LOOKUP_OPS; ++i) {
+            auto result = db.getValue(pregenKeys[i % SETUP_OPS], pregenFields[0], SETUP_OPS);
+            if (result.has_value()) {
+                checksum += static_cast<long long>(result->size());
             }
-        });
-        printResult(result);
+        }
+        auto end = Clock::now();
+        long long micros = elapsedMicros(start, end);
+        printResult(BenchResult::create("Sync getValue (baseline)", LOOKUP_OPS, 1, micros, checksum));
     }
     
     // Multi-threaded getValue
@@ -322,25 +376,24 @@ void benchmarkPointLookups() {
     for (int numThreads : threadCounts) {
         ThreadSafeInMemoryDB db(false);
         for (int i = 0; i < SETUP_OPS; ++i) {
-            db.newInsert("k" + std::to_string(i), "f", "val" + std::to_string(i), i);
+            db.newInsert(pregenKeys[i], pregenFields[0], "val", i);
         }
         
-        auto result = runWithTimeout(
-            "MT getValue (" + std::to_string(numThreads) + " threads)",
-            LOOKUP_OPS, numThreads, [&]() {
-                std::vector<std::thread> threads;
-                
-                for (int t = 0; t < numThreads; ++t) {
-                    threads.emplace_back([&, t]() {
-                        int opsPerThread = LOOKUP_OPS / numThreads;
-                        for (int i = 0; i < opsPerThread; ++i) {
-                            db.getValue("k" + std::to_string((t * opsPerThread + i) % SETUP_OPS), "f", SETUP_OPS);
-                        }
-                    });
+        std::atomic<long long> checksum{0};
+        
+        long long micros = runThreaded(numThreads, [&](int t) {
+            long long localChecksum = 0;
+            for (int i = t; i < LOOKUP_OPS; i += numThreads) {
+                auto result = db.getValue(pregenKeys[i % SETUP_OPS], pregenFields[0], SETUP_OPS);
+                if (result.has_value()) {
+                    localChecksum += static_cast<long long>(result->size());
                 }
-                for (auto& th : threads) th.join();
-            });
-        printResult(result);
+            }
+            checksum.fetch_add(localChecksum, std::memory_order_relaxed);
+        });
+        
+        printResult(BenchResult::create("MT getValue (" + std::to_string(numThreads) + " threads)", 
+                                        LOOKUP_OPS, numThreads, micros, checksum.load()));
     }
 }
 
@@ -355,8 +408,13 @@ int main() {
     
     std::cout << "\nSystem Info:\n";
     std::cout << "   Hardware threads: " << NUM_CORES << "\n";
-    std::cout << "   Timeout per test: " << BENCHMARK_TIMEOUT_MS << " ms\n";
     std::cout << "   C++ Standard:     C++17\n";
+    std::cout << "   Clock:            steady_clock (monotonic)\n";
+    std::cout << "\nNote: Hot-cache microbenchmark, small working set, no I/O.\n";
+    std::cout << "      Results reflect peak throughput under ideal conditions.\n";
+    
+    // Pre-generate keys to avoid string formatting in hot loops
+    initPregenKeys(100000);
     
     benchmarkInserts();
     benchmarkReads();

@@ -34,6 +34,7 @@
 class ThreadSafeInMemoryDB {
 private:
     static constexpr size_t SHARD_COUNT = 16;
+    static constexpr size_t MAX_VERSIONS_PER_FIELD = 100;  // LRU eviction limit
 
     struct FieldEntry {
         std::unique_ptr<DLL> dll;
@@ -112,4 +113,5 @@ public:
 
     size_t getKeyCount() const;
     size_t getTTLQueueSize() const;
+    size_t getVersionCount(const std::string& key, const std::string& field) const;
 };
