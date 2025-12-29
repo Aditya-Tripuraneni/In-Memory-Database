@@ -117,36 +117,20 @@ if (!keyExists) {
 
 ### 1. Insert Performance
 
-#### Before Optimization (Original Implementation)
 ```
 Test                          Ops      Threads   Time(ms)   Ops/sec      Latency(µs)  Checksum
 ────────────────────────────────────────────────────────────────────────────────────────────────
-Sync Insert (baseline)        100000   1         30.12      3,319,833    0.301        100000
-MT Insert (1 thread)          100000   1         77.96      1,282,726    0.780        100000
-MT Insert (2 threads)         100000   2         77.14      1,296,260    0.771        100000
-MT Insert (4 threads)         100000   4         47.24      2,116,626    0.472        100000
-MT Insert (8 threads)         100000   8         45.45      2,200,123    0.455        100000
-MT Insert (16 threads)        100000   16        74.51      1,342,030    0.745        100000
+Sync Insert (baseline)        100000   1         47.84      2,090,345    0.478        100000
+MT Insert (1 thread)          100000   1         39.41      2,537,170    0.394        100000
+MT Insert (2 threads)         100000   2         48.77      2,050,567    0.488        100000
+MT Insert (4 threads)         100000   4         25.02      3,997,122    0.250        100000
+MT Insert (8 threads)         100000   8         27.66      3,615,329    0.277        100000
+MT Insert (16 threads)        100000   16        46.73      2,140,045    0.467        100000
 ```
 
-**Issue**: Single-threaded MT showed **2.6× overhead** vs sync (1.28M vs 3.32M ops/sec). Shard lock held for entire operation caused severe contention. Peak performance of only **2.2M ops/sec** at 8 threads, actually slower than sync baseline.
+**Observation**: Fast-path shared lock optimization delivers **1.21× speedup** over sync at 1 thread (2.54M vs 2.09M ops/sec). Peak performance at 4 threads achieves **4.0M ops/sec**, a **1.91× improvement over sync baseline**. Multi-threading now outperforms sync due to minimized critical section duration.
 
-#### After Optimization (Fast-Path Shared Locks)
-```
-Test                          Ops      Threads   Time(ms)   Ops/sec      Latency(µs)  Checksum
-────────────────────────────────────────────────────────────────────────────────────────────────
-Sync Insert (baseline)        100000   1         30.12      3,319,833    0.301        100000
-MT Insert (1 thread)          100000   1         16.42      6,090,000    0.164        100000
-MT Insert (2 threads)         100000   2         10.85      9,217,000    0.109        100000
-MT Insert (4 threads)         100000   4         6.27       15,940,000   0.063        100000
-MT Insert (8 threads)         100000   8         6.41       15,600,000   0.064        100000
-MT Insert (16 threads)        100000   16        7.89       12,670,000   0.079        100000
-```
-
-**Impact**: 
-- **5.5× faster** single-threaded MT (6.09M vs 1.28M ops/sec)
-- **7.2× faster** at 4 threads vs old MT (15.94M vs 2.12M ops/sec)
-- **4.8× faster** than sync baseline (15.94M vs 3.32M ops/sec)
+**Note** The insert performance bench marking was done on 10k unique keys. 
 
 ### 2. Prefix Scan Performance
 ```
@@ -195,22 +179,22 @@ MT getValue (16 threads)      100000   16        3.15       31,766,201   0.031  
 
 | Metric | Synchronous | Multi-Threaded (Optimized) | Speedup |
 |--------|-------------|---------------------------|---------|
-| Insert Throughput (1 thread) | 2.0M ops/sec | 2.4M ops/sec | **1.24×** |
-| Insert Throughput (4 threads) | 2.0M ops/sec | 3.7M ops/sec | **1.86×** |
+| Insert Throughput (1 thread) | 2.09M ops/sec | 2.54M ops/sec | **1.21×** |
+| Insert Throughput (4 threads) | 2.09M ops/sec | 4.0M ops/sec | **1.91×** |
 | Prefix Scan Latency (16 threads) | 288.2 µs | 53.4 µs | **5.4×** |
 | Mixed Workload (16 threads) | 79.2k ops/sec | 280.9k ops/sec | **3.55×** |
 | Point Lookup (8 threads) | 21.8M ops/sec | 36.7M ops/sec | **1.68×** |
-| Memory Overhead | Baseline | +48 bytes/key (mutexes) | - |
-| TTL Cleanup | Synchronous (blocking) | Async (background thread) | Non-blocking |
+| Memory Overhead | Baseline | +48 bytes/key (mutexes) | |
+| TTL Cleanup | Synchronous (blocking) | Async (background thread) | Nonblocking |
 
 ### Key Observations
 
-1. **Fast-Path Shared Locks Transform Performance**: Previous MT implementation was 2.5× slower than sync for inserts (1.1M vs 3.3M ops/sec). After optimization with 10k unique keys, MT is now **1.24× faster** at 1 thread and **1.86× faster** at 4 threads due to:
+1. **Fast-Path Shared Locks Transform Performance**: Previous MT implementation was 2.5× slower than sync for inserts (1.1M vs 3.3M ops/sec). After optimization with 10k unique keys, MT is now **1.21× faster** at 1 thread and **1.91× faster** at 4 threads due to:
    - Minimal shard lock hold time
    - Shared locks for key lookups 
    - Exclusive locks only for rare new-key insertions
 
-2. **Point Lookups Achieve 36.7M ops/sec**: Single-threaded MT shows ~1.8× overhead on this extremely fast operation (O(1) hash lookup). However, 8-thread configuration achieves **36.7M ops/sec** - a **1.68× speedup** over sync baseline through parallel shared-lock reads.
+2. **Point Lookups Achieve 36.7M ops/sec**: Single-threaded MT shows ~1.8× overhead on this extremely fast operation (O(1) hash lookup). However, 8-thread configuration achieves **36.7M ops/sec**, a **1.68× speedup** over sync baseline through parallel shared-lock reads.
 
 3. **Mixed Workloads Scale to 16 Threads**: Previous plateau at 8 threads (207k ops/sec) eliminated. Now achieves **280.9k ops/sec** at 16 threads because read operations (80% of workload) run with shared locks in parallel.
 
@@ -223,11 +207,6 @@ MT getValue (16 threads)      100000   16        3.15       31,766,201   0.031  
 
 ## Future Directions
 
-### Performance Optimizations Completed ✅
-1. **Fast-Path Shared Locks**: Implemented two-phase lookup (shared first, unique only if needed) dramatically reducing critical section duration
-2. **O(1) LRU Eviction**: Direct timestamp-based hash lookup replaced O(n) linear scan through version history
-3. **Minimized Lock Scope**: Shard locks released immediately after directory operations, data updates occur under per-key locks
-
 ### Near-Term Optimizations
 1. **Lock-Free Trie Reads**: Replace `trieMutex` with atomic reference counting + copy-on-write snapshots to eliminate read serialization
 2. **Partitioned TTL Heap**: Shard min-heap by time ranges (e.g., 16 buckets) to reduce contention on TTL insert path
@@ -236,7 +215,7 @@ MT getValue (16 threads)      100000   16        3.15       31,766,201   0.031  
 ### Scalability Experiments
 1. **Vary Shard Count**: Test 32, 64, 128 shards to find optimal balance between lock contention and cache locality
 2. **Larger Datasets**: Scale to 100k+ keys to stress-test Trie memory efficiency and cleanup performance
-3. **NUMA Awareness**: Pin shards to CPU cores to reduce cross-socket memory access latency
+
 
 ### Advanced Features
 1. **Read-Write Fairness**: Add reader/writer priority queues to prevent starvation under heavy write loads
@@ -302,8 +281,8 @@ int main() {
 
 This experiment demonstrates that **careful lock optimization with reader-writer patterns provides dramatic performance gains across all workload types**. Key achievements:
 
-### Performance Improvements (10k Unique Keys)
-- **Inserts**: 1.86× faster than sync at 4 threads (3.7M vs 2.0M ops/sec)
+### Performance Improvements 
+- **Inserts**: 1.91× faster than sync at 4 threads (4.0M vs 2.09M ops/sec)
 - **Point Lookups**: 1.68× faster at 8 threads (36.7M vs 21.8M ops/sec)  
 - **Prefix Scans**: 5.4× faster at 16 threads (18.7k vs 3.5k ops/sec)
 - **Mixed Workloads**: 3.55× faster at 16 threads (280.9k vs 79.2k ops/sec)
@@ -312,7 +291,7 @@ This experiment demonstrates that **careful lock optimization with reader-writer
 1. **Fast-Path Shared Locks**: Dramatically reduced shard lock contention
    - Shared locks for key lookups
    - Exclusive locks only for new key creation 
-   - Eliminated single-thread MT overhead (now 1.24× faster than sync, was 2.5× slower)
+   - Eliminated single-thread MT overhead (now 1.21× faster than sync, was 2.5× slower)
 
 2. **O(1) LRU Eviction**: Direct timestamp lookup eliminates O(n) scans
    - Constant-time eviction regardless of version history size
@@ -324,11 +303,10 @@ This experiment demonstrates that **careful lock optimization with reader-writer
 
 ### Key Takeaway
 **Minimizing critical section duration matters more than lock-free algorithms.** The dramatic reduction in shard lock hold time transformed a write-bottlenecked system into one that outperforms sync across all workloads. Reader-writer locks with fast-path optimization provide:
-- Correctness (no race conditions)
 - Simplicity (standard library primitives)  
 - Performance (4-5× speedups without lock-free complexity)
 
-The sharded architecture with per-key locks and fast-path shared reads provides an excellent balance of correctness, maintainability, and performance for multi-threaded key-value stores.
+The sharded architecture with per-key locks and fast-path shared reads provides a  balance of correctness, maintainability, and performance for multi-threaded key-value stores.
 
 ---
 
