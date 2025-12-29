@@ -25,8 +25,9 @@
 using Clock = std::chrono::steady_clock;
 using Micros = std::chrono::microseconds;
 
-// Hardware info
+// Constants
 const unsigned int NUM_CORES = std::thread::hardware_concurrency();
+constexpr size_t SHARD_COUNT = 16;  // Must match ThreadSafeInMemoryDB::SHARD_COUNT
 
 //------------------------------------------------------------------------------
 // Pre-generated keys to avoid string formatting in hot loops
@@ -153,11 +154,13 @@ void benchmarkInserts() {
     printHeader();
     
     const int OPS = 100000;
-    const int KEY_MOD = 100;
+    const int KEY_MOD = 10000;  
+    const int RESERVE_SIZE = 10200;  
     
     // Synchronous baseline
     {
         InMemoryDB db;
+        db.reserveKeys(RESERVE_SIZE);
         long long successCount = 0;
         
         auto start = Clock::now();
@@ -177,6 +180,7 @@ void benchmarkInserts() {
     
     for (int numThreads : threadCounts) {
         ThreadSafeInMemoryDB db(false);
+        db.reserveKeys(RESERVE_SIZE / SHARD_COUNT + 10);  // Per-shard reserve
         std::atomic<long long> successCount{0};
         
         long long micros = runThreaded(numThreads, [&](int t) {
@@ -218,6 +222,7 @@ void benchmarkReads() {
     // Synchronous baseline
     {
         InMemoryDB db;
+        db.reserveKeys(SETUP_KEYS + 100);
         for (int i = 0; i < SETUP_KEYS; ++i) {
             for (int f = 0; f < FIELDS_PER_KEY; ++f) {
                 db.newInsert(keyNames[i], pregenFields[f], "v", i);
@@ -241,6 +246,7 @@ void benchmarkReads() {
     
     for (int numThreads : threadCounts) {
         ThreadSafeInMemoryDB db(false);
+        db.reserveKeys((SETUP_KEYS / SHARD_COUNT) + 10);
         for (int i = 0; i < SETUP_KEYS; ++i) {
             for (int f = 0; f < FIELDS_PER_KEY; ++f) {
                 db.newInsert(keyNames[i], pregenFields[f], "v", i);
@@ -280,6 +286,7 @@ void benchmarkMixed() {
     // Synchronous baseline
     {
         InMemoryDB db;
+        db.reserveKeys(150);  // 100 user keys + margin
         for (int i = 0; i < SETUP_OPS; ++i) {
             db.newInsert(pregenUserKeys[i], pregenFields[0], "v", i);
         }
@@ -307,6 +314,7 @@ void benchmarkMixed() {
     
     for (int numThreads : threadCounts) {
         ThreadSafeInMemoryDB db(false);
+        db.reserveKeys(10);  // ~100/16 shards + margin
         for (int i = 0; i < SETUP_OPS; ++i) {
             db.newInsert(pregenUserKeys[i], pregenFields[0], "v", i);
         }
@@ -352,6 +360,7 @@ void benchmarkPointLookups() {
     // Synchronous baseline
     {
         InMemoryDB db;
+        db.reserveKeys(SETUP_OPS + 50);
         for (int i = 0; i < SETUP_OPS; ++i) {
             db.newInsert(pregenKeys[i], pregenFields[0], "val", i);
         }
@@ -375,6 +384,7 @@ void benchmarkPointLookups() {
     
     for (int numThreads : threadCounts) {
         ThreadSafeInMemoryDB db(false);
+        db.reserveKeys((SETUP_OPS / SHARD_COUNT) + 10);
         for (int i = 0; i < SETUP_OPS; ++i) {
             db.newInsert(pregenKeys[i], pregenFields[0], "val", i);
         }
@@ -402,8 +412,8 @@ void benchmarkPointLookups() {
 int main() {
     std::cout << "\n";
     std::cout << "╔═══════════════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║                 IN-MEMORY DATABASE BENCHMARK SUITE                     ║\n";
-    std::cout << "║                    Sync vs Multi-threaded Performance                  ║\n";
+    std::cout << "║                 IN-MEMORY DATABASE BENCHMARK SUITE                    ║\n";
+    std::cout << "║                    Sync vs Multi-threaded Performance                 ║\n";
     std::cout << "╚═══════════════════════════════════════════════════════════════════════╝\n";
     
     std::cout << "\nSystem Info:\n";

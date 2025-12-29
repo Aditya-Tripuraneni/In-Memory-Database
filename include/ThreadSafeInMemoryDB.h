@@ -114,4 +114,11 @@ public:
     size_t getKeyCount() const;
     size_t getTTLQueueSize() const;
     size_t getVersionCount(const std::string& key, const std::string& field) const;
+    
+    void reserveKeys(size_t capacityPerShard) {
+        for (auto& shard : shards) {
+            std::unique_lock lock(shard.shardMutex);
+            shard.keys.reserve(capacityPerShard);
+        }
+    }
 };

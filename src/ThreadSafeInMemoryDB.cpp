@@ -136,12 +136,30 @@ bool ThreadSafeInMemoryDB::newInsert(const std::string& key,
 
     size_t shardIndex = shardForKey(key);
     Shard& shard = shards[shardIndex];
-    std::unique_lock<std::shared_mutex> shardLock(shard.shardMutex);
+    
+    // Fast path: Try to find existing key with shared lock
+    std::shared_ptr<KeyBucket> keyBucket;
+    bool keyExists = false;
+    {
+        std::shared_lock<std::shared_mutex> shardLock(shard.shardMutex);
+        auto keyEntry = shard.keys.find(key);
+        if (keyEntry != shard.keys.end()) {
+            keyBucket = keyEntry->second;
+            keyExists = true;
+        }
+    }
+    
+    // Slow path: Key doesn't exist
+    // Lock shard exclusively 
+    bool keyWasJustInserted = false;
+    if (!keyExists) {
+        std::unique_lock<std::shared_mutex> shardLock(shard.shardMutex);
+        auto [keyEntry, inserted] = shard.keys.emplace(key, std::make_shared<KeyBucket>());
+        keyBucket = keyEntry->second;
+        keyWasJustInserted = inserted;
+    }
 
-    auto [keyEntry, inserted] = shard.keys.emplace(key, std::make_shared<KeyBucket>());
-    std::shared_ptr<KeyBucket> keyBucket = keyEntry->second;
-
-    std::unique_lock<std::shared_mutex> keyLock(keyBucket->keyMutex);
+    std::unique_lock<std::shared_mutex> keyLock(keyBucket->keyMutex); // Lock key for writing
 
     FieldEntry& fieldEntry = keyBucket->fields[field];
     if (!fieldEntry.dll) {
@@ -160,25 +178,19 @@ bool ThreadSafeInMemoryDB::newInsert(const std::string& key,
     if (static_cast<size_t>(fieldEntry.dll->getLength()) > MAX_VERSIONS_PER_FIELD) {
         Node* oldestNode = fieldEntry.dll->getOldest();
         if (oldestNode && !fieldEntry.dll->isDummy(oldestNode)) {
-            // Find the timestamp of the oldest node to remove it from node_map
-            for (auto it = fieldEntry.node_map.begin(); it != fieldEntry.node_map.end(); ++it) {
-                if (it->second == oldestNode) {
-                    fieldEntry.node_map.erase(it);
-                    break;
-                }
-            }
+            fieldEntry.node_map.erase(oldestNode->timestamp);
             fieldEntry.dll->deleteNode(oldestNode);
         }
     }
 
-    if (inserted) {
+    // Insert into Trie only if this is a newly inserted key (not just a new field value)
+    if (keyWasJustInserted) {
         size_t trieShard = shardForTrieKey(key);
         std::unique_lock<std::shared_mutex> trieLock(trieShards[trieShard].trieMutex);
         trieShards[trieShard].trie.insert(key);
     }
 
     keyLock.unlock();
-    shardLock.unlock();
 
     if (ttl.has_value()) {
         std::lock_guard<std::mutex> ttlLock(ttlMutex);

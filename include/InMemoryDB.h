@@ -48,4 +48,8 @@ public:
     std::optional<std::string> getValue(const std::string& key,
                                         const std::string& field,
                                         int timestamp);
+
+    void reserveKeys(size_t capacity) {
+        db.reserve(capacity);
+    }
 };
