@@ -125,16 +125,12 @@ bool ThreadSafeInMemoryDB::isExpired(int currentTimeStamp, Node* node) const {
     return currentTimeStamp >= node->timestamp + node->ttl.value();
 }
 
-bool ThreadSafeInMemoryDB::newInsert(const std::string& key,
-                                     const std::string& field,
-                                     const std::string& record,
-                                     int timestamp,
-                                     std::optional<int> ttl) {
-    if (key.empty() || field.empty() || record.empty() || timestamp < 0) {
+bool ThreadSafeInMemoryDB::newInsert(const Record& record) {
+    if (record.key.empty() || record.field.empty() || record.value.empty() || record.timestamp < 0) {
         return false;
     }
 
-    size_t shardIndex = shardForKey(key);
+    size_t shardIndex = shardForKey(record.key);
     Shard& shard = shards[shardIndex];
     
     // Fast path: Try to find existing key with shared lock
@@ -142,7 +138,7 @@ bool ThreadSafeInMemoryDB::newInsert(const std::string& key,
     bool keyExists = false;
     {
         std::shared_lock<std::shared_mutex> shardLock(shard.shardMutex);
-        auto keyEntry = shard.keys.find(key);
+        auto keyEntry = shard.keys.find(record.key);
         if (keyEntry != shard.keys.end()) {
             keyBucket = keyEntry->second;
             keyExists = true;
@@ -154,25 +150,25 @@ bool ThreadSafeInMemoryDB::newInsert(const std::string& key,
     bool keyWasJustInserted = false;
     if (!keyExists) {
         std::unique_lock<std::shared_mutex> shardLock(shard.shardMutex);
-        auto [keyEntry, inserted] = shard.keys.emplace(key, std::make_shared<KeyBucket>());
+        auto [keyEntry, inserted] = shard.keys.emplace(record.key, std::make_shared<KeyBucket>());
         keyBucket = keyEntry->second;
         keyWasJustInserted = inserted;
     }
 
     std::unique_lock<std::shared_mutex> keyLock(keyBucket->keyMutex); // Lock key for writing
 
-    FieldEntry& fieldEntry = keyBucket->fields[field];
+    FieldEntry& fieldEntry = keyBucket->fields[record.field];
     if (!fieldEntry.dll) {
         fieldEntry.dll = std::make_unique<DLL>();
     }
 
-    if (fieldEntry.node_map.count(timestamp) > 0) {
+    if (fieldEntry.node_map.count(record.timestamp) > 0) {
         return false;
     }
 
-    Node* newNode = new Node(record, timestamp, ttl);
+    Node* newNode = new Node(record.value, record.timestamp, record.ttl);
     fieldEntry.dll->insertAtEnd(newNode);
-    fieldEntry.node_map[timestamp] = newNode;
+    fieldEntry.node_map[record.timestamp] = newNode;
 
     // LRU eviction: if DLL exceeds max versions, remove oldest node
     if (static_cast<size_t>(fieldEntry.dll->getLength()) > MAX_VERSIONS_PER_FIELD) {
@@ -185,16 +181,16 @@ bool ThreadSafeInMemoryDB::newInsert(const std::string& key,
 
     // Insert into Trie only if this is a newly inserted key (not just a new field value)
     if (keyWasJustInserted) {
-        size_t trieShard = shardForTrieKey(key);
+        size_t trieShard = shardForTrieKey(record.key);
         std::unique_lock<std::shared_mutex> trieLock(trieShards[trieShard].trieMutex);
-        trieShards[trieShard].trie.insert(key);
+        trieShards[trieShard].trie.insert(record.key);
     }
 
     keyLock.unlock();
 
-    if (ttl.has_value()) {
+    if (record.ttl.has_value()) {
         std::lock_guard<std::mutex> ttlLock(ttlMutex);
-        minHeapTTLData.emplace(timestamp + ttl.value(), key, field, timestamp);
+        minHeapTTLData.emplace(record.timestamp + record.ttl.value(), record.key, record.field, record.timestamp);
         cleanupCV.notify_all();
     }
 

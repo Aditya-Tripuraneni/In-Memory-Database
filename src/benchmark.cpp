@@ -21,6 +21,7 @@
 
 #include "InMemoryDB.h"
 #include "ThreadSafeInMemoryDB.h"
+#include "Record.h"
 
 using Clock = std::chrono::steady_clock;
 using Micros = std::chrono::microseconds;
@@ -165,7 +166,7 @@ void benchmarkInserts() {
         
         auto start = Clock::now();
         for (int i = 0; i < OPS; ++i) {
-            if (db.newInsert(pregenKeys[i % KEY_MOD], pregenFields[0], "v", i)) {
+            if (db.newInsert(Record::create(pregenKeys[i % KEY_MOD], pregenFields[0], "v", i))) {
                 successCount++;
             }
         }
@@ -186,7 +187,7 @@ void benchmarkInserts() {
         long long micros = runThreaded(numThreads, [&](int t) {
             long long localSuccess = 0;
             for (int i = t; i < OPS; i += numThreads) {
-                if (db.newInsert(pregenKeys[i % KEY_MOD], pregenFields[0], "v", i)) {
+                if (db.newInsert(Record::create(pregenKeys[i % KEY_MOD], pregenFields[0], "v", i))) {
                     localSuccess++;
                 }
             }
@@ -225,7 +226,7 @@ void benchmarkReads() {
         db.reserveKeys(SETUP_KEYS + 100);
         for (int i = 0; i < SETUP_KEYS; ++i) {
             for (int f = 0; f < FIELDS_PER_KEY; ++f) {
-                db.newInsert(keyNames[i], pregenFields[f], "v", i);
+                db.newInsert(Record::create(keyNames[i], pregenFields[f], "v", i));
             }
         }
 
@@ -249,7 +250,7 @@ void benchmarkReads() {
         db.reserveKeys((SETUP_KEYS / SHARD_COUNT) + 10);
         for (int i = 0; i < SETUP_KEYS; ++i) {
             for (int f = 0; f < FIELDS_PER_KEY; ++f) {
-                db.newInsert(keyNames[i], pregenFields[f], "v", i);
+                db.newInsert(Record::create(keyNames[i], pregenFields[f], "v", i));
             }
         }
 
@@ -288,14 +289,14 @@ void benchmarkMixed() {
         InMemoryDB db;
         db.reserveKeys(150);  // 100 user keys + margin
         for (int i = 0; i < SETUP_OPS; ++i) {
-            db.newInsert(pregenUserKeys[i], pregenFields[0], "v", i);
+            db.newInsert(Record::create(pregenUserKeys[i], pregenFields[0], "v", i));
         }
         
         long long checksum = 0;
         auto start = Clock::now();
         for (int i = 0; i < MIXED_OPS; ++i) {
             if (i % 5 == 0) {
-                if (db.newInsert(pregenUserKeys[i % 100], pregenFields[0], "v", SETUP_OPS + i)) {
+                if (db.newInsert(Record::create(pregenUserKeys[i % 100], pregenFields[0], "v", SETUP_OPS + i))) {
                     checksum++;
                 }
             } else {
@@ -316,7 +317,7 @@ void benchmarkMixed() {
         ThreadSafeInMemoryDB db(false);
         db.reserveKeys(10);  // ~100/16 shards + margin
         for (int i = 0; i < SETUP_OPS; ++i) {
-            db.newInsert(pregenUserKeys[i], pregenFields[0], "v", i);
+            db.newInsert(Record::create(pregenUserKeys[i], pregenFields[0], "v", i));
         }
         
         std::atomic<int> writeTimestamp{SETUP_OPS};
@@ -327,7 +328,7 @@ void benchmarkMixed() {
             for (int i = t; i < MIXED_OPS; i += numThreads) {
                 if (i % 5 == 0) {
                     int ts = writeTimestamp.fetch_add(1);
-                    if (db.newInsert(pregenUserKeys[i % 100], pregenFields[0], "v", ts)) {
+                    if (db.newInsert(Record::create(pregenUserKeys[i % 100], pregenFields[0], "v", ts))) {
                         localChecksum++;
                     }
                 } else {
@@ -362,7 +363,7 @@ void benchmarkPointLookups() {
         InMemoryDB db;
         db.reserveKeys(SETUP_OPS + 50);
         for (int i = 0; i < SETUP_OPS; ++i) {
-            db.newInsert(pregenKeys[i], pregenFields[0], "val", i);
+            db.newInsert(Record::create(pregenKeys[i], pregenFields[0], "val", i));
         }
         
         long long checksum = 0;
@@ -386,7 +387,7 @@ void benchmarkPointLookups() {
         ThreadSafeInMemoryDB db(false);
         db.reserveKeys((SETUP_OPS / SHARD_COUNT) + 10);
         for (int i = 0; i < SETUP_OPS; ++i) {
-            db.newInsert(pregenKeys[i], pregenFields[0], "val", i);
+            db.newInsert(Record::create(pregenKeys[i], pregenFields[0], "val", i));
         }
         
         std::atomic<long long> checksum{0};

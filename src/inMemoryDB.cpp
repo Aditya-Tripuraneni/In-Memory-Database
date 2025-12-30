@@ -62,19 +62,15 @@ bool InMemoryDB::isExpired(int currentTimeStamp, Node* node) {
     return currentTimeStamp >= node->timestamp + node->ttl.value();
 }
 
-bool InMemoryDB::newInsert(const std::string& key,
-                           const std::string& field,
-                           const std::string& record,
-                           int timestamp,
-                           std::optional<int> ttl) {
-    if (key.empty() || field.empty() || record.empty() || timestamp < 0) {
+bool InMemoryDB::newInsert(const Record& record) {
+    if (record.key.empty() || record.field.empty() || record.value.empty() || record.timestamp < 0) {
         return false;
     }
 
-    cleanExpiredData(timestamp);
+    cleanExpiredData(record.timestamp);
 
-    auto& fieldMap = db[key];
-    FieldEntry& fieldEntry = fieldMap[field];
+    auto& fieldMap = db[record.key];
+    FieldEntry& fieldEntry = fieldMap[record.field];
     if (!fieldEntry.dll) {
         fieldEntry.dll = std::make_unique<DLL>();
         if (!fieldEntry.dll) {
@@ -82,23 +78,23 @@ bool InMemoryDB::newInsert(const std::string& key,
         }
     }
 
-    if (fieldEntry.node_map.find(timestamp) != fieldEntry.node_map.end()) {
+    if (fieldEntry.node_map.find(record.timestamp) != fieldEntry.node_map.end()) {
         return false;
     }
 
-    Node* newNode = new Node(record, timestamp, ttl);
+    Node* newNode = new Node(record.value, record.timestamp, record.ttl);
     if (!newNode) {
         return false;
     }
 
     fieldEntry.dll->insertAtEnd(newNode);
-    fieldEntry.node_map[timestamp] = newNode;
+    fieldEntry.node_map[record.timestamp] = newNode;
 
-    keyTrie.insert(key);
+    keyTrie.insert(record.key);
 
-    if (ttl.has_value()) {
-        int expiryTime = timestamp + ttl.value();
-        minHeapTTLData.emplace(expiryTime, key, field, timestamp);
+    if (record.ttl.has_value()) {
+        int expiryTime = record.timestamp + record.ttl.value();
+        minHeapTTLData.emplace(expiryTime, record.key, record.field, record.timestamp);
     }
 
     return true;
